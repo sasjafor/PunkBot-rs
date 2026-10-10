@@ -36,32 +36,34 @@ pub fn parse_time(value: &str) -> Option<u64> {
 }
 
 pub fn parse_iso_duration(value: &str) -> Option<u64> {
-    let mut total = 0;
+    let mut total = 0_u64;
     let mut number = String::new();
     let mut in_time = false;
+    let mut saw_period = false;
     for ch in value.chars() {
         match ch {
-            'T' => in_time = true,
+            'P' if !saw_period && !in_time && number.is_empty() => saw_period = true,
+            'T' if saw_period && !in_time && number.is_empty() => in_time = true,
             '0'..='9' => number.push(ch),
-            'D' => {
-                total += number.parse::<u64>().ok()? * 86_400;
+            'D' if saw_period && !in_time => {
+                total = total.checked_add(number.parse::<u64>().ok()?.checked_mul(86_400)?)?;
                 number.clear();
             }
             'H' if in_time => {
-                total += number.parse::<u64>().ok()? * 3_600;
+                total = total.checked_add(number.parse::<u64>().ok()?.checked_mul(3_600)?)?;
                 number.clear();
             }
             'M' if in_time => {
-                total += number.parse::<u64>().ok()? * 60;
+                total = total.checked_add(number.parse::<u64>().ok()?.checked_mul(60)?)?;
                 number.clear();
             }
             'S' if in_time => {
-                total += number.parse::<u64>().ok()?;
+                total = total.checked_add(number.parse::<u64>().ok()?)?;
                 number.clear();
             }
             'Y' | 'M' | 'W' => return None,
             _ => return None,
         }
     }
-    Some(total)
+    (saw_period && number.is_empty()).then_some(total)
 }
