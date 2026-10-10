@@ -5,6 +5,8 @@ use std::{
     io::{self, Read},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::{Mutex, mpsc},
+    thread,
 };
 use tokio::process::Command as AsyncCommand;
 
@@ -129,7 +131,7 @@ impl MediaSettings {
             .stdin(Stdio::from(input))
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        let transcoder = match transcoder.spawn() {
+        let mut transcoder = match transcoder.spawn() {
             Ok(child) => child,
             Err(error) => {
                 let _ = downloader.kill();
@@ -137,7 +139,23 @@ impl MediaSettings {
                 return Err(AudioStreamError::Fail(Box::new(error)));
             }
         };
-        let source = MediaPipeline::new(vec![downloader, transcoder]);
+        let output = transcoder.stdout.take().ok_or_else(|| {
+            AudioStreamError::Fail(Box::new(io::Error::other(
+                "FFmpeg did not provide an output stream",
+            )))
+        })?;
+        let source = match MediaPipeline::new(output, vec![downloader, transcoder]) {
+            Ok(source) => source,
+            Err((error, mut children)) => {
+                for child in &mut children {
+                    let _ = child.kill();
+                }
+                for child in children.iter_mut().rev() {
+                    let _ = child.wait();
+                }
+                return Err(AudioStreamError::Fail(Box::new(error)));
+            }
+        };
         let input: Input = RawAdapter::new(source, 48_000, 2).into();
         match input {
             Input::Live(LiveInput::Raw(stream), _) => Ok(stream),
@@ -171,21 +189,75 @@ impl MediaSettings {
 
 struct MediaPipeline {
     children: Vec<Child>,
+    chunks: Mutex<mpsc::Receiver<Vec<u8>>>,
+    current_chunk: Option<Vec<u8>>,
+    current_offset: usize,
 }
 
 impl MediaPipeline {
-    fn new(children: Vec<Child>) -> Self {
-        Self { children }
+    const READ_CHUNK_BYTES: usize = 32 * 1024;
+    const BUFFERED_CHUNKS: usize = 24;
+
+    fn new(
+        mut output: std::process::ChildStdout,
+        children: Vec<Child>,
+    ) -> Result<Self, (io::Error, Vec<Child>)> {
+        let (sender, receiver) = mpsc::sync_channel(Self::BUFFERED_CHUNKS);
+        let worker = thread::Builder::new()
+            .name("punkbot-audio-read-ahead".to_owned())
+            .spawn(move || {
+                loop {
+                    let mut chunk = vec![0; Self::READ_CHUNK_BYTES];
+                    match output.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(bytes_read) => {
+                            chunk.truncate(bytes_read);
+                            if sender.send(chunk).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+
+        match worker {
+            Ok(_) => Ok(Self {
+                children,
+                chunks: Mutex::new(receiver),
+                current_chunk: None,
+                current_offset: 0,
+            }),
+            Err(error) => Err((error, children)),
+        }
     }
 }
 
 impl Read for MediaPipeline {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        self.children
-            .last_mut()
-            .and_then(|child| child.stdout.as_mut())
-            .ok_or_else(|| io::Error::other("FFmpeg did not provide an output stream"))?
-            .read(buffer)
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+
+        if self.current_chunk.is_none() {
+            let receiver = self
+                .chunks
+                .get_mut()
+                .map_err(|_| io::Error::other("audio read-ahead buffer was poisoned"))?;
+            self.current_chunk = receiver.recv().ok();
+            self.current_offset = 0;
+        }
+
+        let Some(chunk) = self.current_chunk.as_ref() else {
+            return Ok(0);
+        };
+        let bytes_read = buffer.len().min(chunk.len() - self.current_offset);
+        buffer[..bytes_read]
+            .copy_from_slice(&chunk[self.current_offset..self.current_offset + bytes_read]);
+        self.current_offset += bytes_read;
+        if self.current_offset == chunk.len() {
+            self.current_chunk = None;
+        }
+        Ok(bytes_read)
     }
 }
 
