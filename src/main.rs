@@ -73,6 +73,9 @@ async fn on_error(error: poise::FrameworkError<'_, Data, PError>) {
 #[tokio::main]
 async fn main() -> Result<(), PError> {
     tracing_subscriber::fmt::init();
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider())
+        .map_err(|_| "Could not install the Rustls ring crypto provider")?;
+
     let mut token = env::var("DISCORD_APP_AUTH_TOKEN").ok();
     let mut youtube_key = env::var("YOUTUBE_API_KEY").ok();
     for argument in env::args().skip(1) {
