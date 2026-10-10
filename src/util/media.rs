@@ -1,11 +1,10 @@
 use poise::serenity_prelude::async_trait;
 use songbird::input::core::io::MediaSource;
-use songbird::input::{
-    AudioStream, AudioStreamError, ChildContainer, Compose, Input, LiveInput, RawAdapter,
-};
+use songbird::input::{AudioStream, AudioStreamError, Compose, Input, LiveInput, RawAdapter};
 use std::{
+    io::{self, Read},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
 };
 use tokio::process::Command as AsyncCommand;
 
@@ -34,6 +33,41 @@ impl MediaSettings {
             filters: filters.to_owned(),
             cookies: self.cookies.clone(),
         })))
+    }
+
+    pub async fn validate_filters(&self, filters: &str) -> Result<(), String> {
+        if filters.trim().is_empty() {
+            return Ok(());
+        }
+        let output = AsyncCommand::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=48000:cl=stereo",
+                "-t",
+                "0.1",
+                "-af",
+                filters,
+                "-f",
+                "null",
+                "-",
+            ])
+            .output()
+            .await
+            .map_err(|error| format!("Could not validate FFmpeg filters: {error}"))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let details = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        Err(if details.is_empty() {
+            "FFmpeg rejected the filter expression".to_owned()
+        } else {
+            format!("FFmpeg rejected the filter expression: {details}")
+        })
     }
 
     fn spawn(
@@ -103,9 +137,7 @@ impl MediaSettings {
                 return Err(AudioStreamError::Fail(Box::new(error)));
             }
         };
-        let source = songbird::input::core::io::ReadOnlySource::new(ChildContainer::new(vec![
-            downloader, transcoder,
-        ]));
+        let source = MediaPipeline::new(vec![downloader, transcoder]);
         let input: Input = RawAdapter::new(source, 48_000, 2).into();
         match input {
             Input::Live(LiveInput::Raw(stream), _) => Ok(stream),
@@ -134,6 +166,57 @@ impl MediaSettings {
             .parse::<f64>()
             .ok()
             .map(|v| v.max(0.0) as u64)
+    }
+}
+
+struct MediaPipeline {
+    children: Vec<Child>,
+}
+
+impl MediaPipeline {
+    fn new(children: Vec<Child>) -> Self {
+        Self { children }
+    }
+}
+
+impl Read for MediaPipeline {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.children
+            .last_mut()
+            .and_then(|child| child.stdout.as_mut())
+            .ok_or_else(|| io::Error::other("FFmpeg did not provide an output stream"))?
+            .read(buffer)
+    }
+}
+
+impl io::Seek for MediaPipeline {
+    fn seek(&mut self, _: io::SeekFrom) -> io::Result<u64> {
+        Err(io::Error::other("media pipeline does not support seeking"))
+    }
+}
+
+impl MediaSource for MediaPipeline {
+    fn is_seekable(&self) -> bool {
+        false
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        None
+    }
+}
+
+impl Drop for MediaPipeline {
+    fn drop(&mut self) {
+        let upstream_count = self.children.len().saturating_sub(1);
+        for child in self.children.iter_mut().take(upstream_count) {
+            let _ = child.kill();
+        }
+        if let Some(transcoder) = self.children.last_mut() {
+            let _ = transcoder.kill();
+        }
+        for child in self.children.iter_mut().rev() {
+            let _ = child.wait();
+        }
     }
 }
 

@@ -295,11 +295,16 @@ impl Player {
         ctx: &poise::Context<'_, Data, crate::PError>,
         filters: String,
     ) -> Result<(), String> {
-        self.filters = filters;
+        ctx.data().media.validate_filters(&filters).await?;
+        let previous_filters = std::mem::replace(&mut self.filters, filters);
         if self.items.is_empty() {
             return Ok(());
         }
-        self.rebuild_queue(ctx, true).await
+        if let Err(error) = self.rebuild_queue(ctx, true).await {
+            self.filters = previous_filters;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub async fn set_volume(&mut self, ctx: &poise::Context<'_, Data, crate::PError>, value: f32) {
