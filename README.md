@@ -10,6 +10,8 @@ A Rust implementation of [PunkBot](https://github.com/sasjafor/PunkBot), followi
 - `libopus` development files when building on Linux
 - A Discord application bot token and a YouTube Data API key
 
+Enable the Discord **Message Content Intent** for the application if you want the legacy `!` command notice. Slash commands and playback use the guild, voice-state, and guild-message intents.
+
 Set `DISCORD_APP_AUTH_TOKEN` and `YOUTUBE_API_KEY`, then run:
 
 ```sh

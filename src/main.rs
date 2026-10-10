@@ -131,6 +131,15 @@ async fn main() -> Result<(), PError> {
         .register_songbird()
         .await?;
 
+    let shard_manager = client.shard_manager.clone();
+    tokio::spawn(async move {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::error!("Could not install Ctrl+C handler: {error}");
+            return;
+        }
+        shard_manager.shutdown_all().await;
+    });
+
     if let Ok(healthcheck_url) = env::var("HEALTHCHECK_URL") {
         tokio::spawn(async move {
             let client = reqwest::Client::new();

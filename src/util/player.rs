@@ -334,24 +334,27 @@ impl Player {
         order.shuffle(&mut rand::rng());
         call_lock.lock().await.queue().modify_queue(|tracks| {
             let current = tracks.pop_front();
-            let mut waiting = std::mem::take(tracks);
+            let mut waiting = tracks.drain(..).map(Some).collect::<Vec<_>>();
             if let Some(current) = current {
                 tracks.push_back(current);
             }
             for index in &order {
-                if let Some(track) = waiting.remove(*index) {
+                if let Some(Some(track)) = waiting.get_mut(*index).map(Option::take) {
                     tracks.push_back(track);
                 }
             }
         });
         if !self.items.is_empty() {
             let current = self.items.pop_front();
-            let mut waiting = std::mem::take(&mut self.items);
+            let mut waiting = std::mem::take(&mut self.items)
+                .into_iter()
+                .map(Some)
+                .collect::<Vec<_>>();
             if let Some(current) = current {
                 self.items.push_back(current);
             }
             for index in order {
-                if let Some(item) = waiting.remove(index) {
+                if let Some(item) = waiting.get_mut(index).and_then(Option::take) {
                     self.items.push_back(item);
                 }
             }
@@ -493,7 +496,12 @@ impl VoiceEventHandler for QueueEndHandler {
             let queue = self.queue.clone();
             tokio::spawn(async move {
                 tokio::task::yield_now().await;
-                let _ = queue.skip();
+                if queue
+                    .current()
+                    .is_some_and(|current| current.uuid().as_u128() == ended_uuid)
+                {
+                    let _ = queue.skip();
+                }
             });
             return None;
         }
