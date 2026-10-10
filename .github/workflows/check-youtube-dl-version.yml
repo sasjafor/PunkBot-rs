@@ -1,0 +1,50 @@
+name: Update yt-dlp version
+
+on:
+  schedule:
+    - cron: '0 10 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: update-yt-dlp-version
+  cancel-in-progress: false
+
+jobs:
+  get-version:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v7
+
+      - name: Fetch the latest yt-dlp release version
+        run: |
+          curl --fail --silent --show-error --location \
+            https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest \
+            | jq --exit-status --raw-output '.tag_name' \
+            > .release-versions/youtube-dlp-latest.txt
+
+      - name: Commit version update
+        id: version
+        run: |
+          if git diff --quiet -- .release-versions/youtube-dlp-latest.txt; then
+            echo "modified=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          version="$(cat .release-versions/youtube-dlp-latest.txt)"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .release-versions/youtube-dlp-latest.txt
+          git commit -m "chore: update yt-dlp to ${version}"
+          git push
+          echo "modified=true" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger Docker image build
+        if: steps.version.outputs.modified == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run docker-image-ci.yml --ref master
