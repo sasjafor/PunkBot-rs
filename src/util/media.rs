@@ -2,17 +2,27 @@ use poise::serenity_prelude::async_trait;
 use songbird::input::core::io::MediaSource;
 use songbird::input::{AudioStream, AudioStreamError, Compose, Input, LiveInput, RawAdapter};
 use std::{
-    io::{self, Read},
+    fs::{self, File, OpenOptions},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Mutex, mpsc},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     thread,
 };
 use tokio::process::Command as AsyncCommand;
+use tokio::sync::Notify;
 
-#[derive(Clone, Default)]
+const DEFAULT_AUDIO_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+static NEXT_CACHE_FILE_ID: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone)]
 pub struct MediaSettings {
     pub cookies: Option<PathBuf>,
+    audio_cache: Arc<AudioCacheBudget>,
 }
 
 impl MediaSettings {
@@ -25,7 +35,14 @@ impl MediaSettings {
                     .is_file()
                     .then(|| PathBuf::from(".data/youtube.data"))
             });
-        Self { cookies }
+        let max_bytes = std::env::var("AUDIO_CACHE_MAX_BYTES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(DEFAULT_AUDIO_CACHE_MAX_BYTES);
+        Self {
+            cookies,
+            audio_cache: Arc::new(AudioCacheBudget::new(max_bytes)),
+        }
     }
 
     pub fn input(&self, url: &str, seek_seconds: u64, filters: &str) -> Result<Input, String> {
@@ -34,6 +51,7 @@ impl MediaSettings {
             seek_seconds,
             filters: filters.to_owned(),
             cookies: self.cookies.clone(),
+            replay_cache: Arc::new(ReplayCache::new(self.audio_cache.clone())),
         })))
     }
 
@@ -77,6 +95,7 @@ impl MediaSettings {
         url: &str,
         seek_seconds: u64,
         filters: &str,
+        replay_cache: Arc<ReplayCache>,
     ) -> Result<AudioStream<Box<dyn MediaSource>>, AudioStreamError> {
         let mut downloader = Command::new("yt-dlp");
         downloader.args([
@@ -144,9 +163,15 @@ impl MediaSettings {
                 "FFmpeg did not provide an output stream",
             )))
         })?;
-        let source = match MediaPipeline::new(output, vec![downloader, transcoder]) {
+        replay_cache.start();
+        let source = match MediaPipeline::new(
+            output,
+            vec![downloader, transcoder],
+            Some(replay_cache.clone()),
+        ) {
             Ok(source) => source,
             Err((error, mut children)) => {
+                replay_cache.disable();
                 for child in &mut children {
                     let _ = child.kill();
                 }
@@ -187,6 +212,245 @@ impl MediaSettings {
     }
 }
 
+impl Default for MediaSettings {
+    fn default() -> Self {
+        Self {
+            cookies: None,
+            audio_cache: Arc::new(AudioCacheBudget::new(DEFAULT_AUDIO_CACHE_MAX_BYTES)),
+        }
+    }
+}
+
+struct AudioCacheBudget {
+    max_bytes: u64,
+    used_bytes: AtomicU64,
+}
+
+impl AudioCacheBudget {
+    fn new(max_bytes: u64) -> Self {
+        Self {
+            max_bytes,
+            used_bytes: AtomicU64::new(0),
+        }
+    }
+
+    fn reserve(&self, bytes: u64) -> bool {
+        let mut used = self.used_bytes.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = used.checked_add(bytes) else {
+                return false;
+            };
+            if next > self.max_bytes {
+                return false;
+            }
+            match self.used_bytes.compare_exchange_weak(
+                used,
+                next,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => used = actual,
+            }
+        }
+    }
+
+    fn release(&self, bytes: u64) {
+        self.used_bytes.fetch_sub(bytes, Ordering::AcqRel);
+    }
+
+    fn create_file(&self) -> io::Result<(PathBuf, File)> {
+        let directory = std::env::temp_dir().join("punkbot-rs-audio-cache");
+        fs::create_dir_all(&directory)?;
+        loop {
+            let id = NEXT_CACHE_FILE_ID.fetch_add(1, Ordering::Relaxed);
+            let path = directory.join(format!("{}-{id}.f32le", std::process::id()));
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => return Ok((path, file)),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+enum ReplayCacheState {
+    Empty,
+    Writing {
+        path: PathBuf,
+        file: File,
+        bytes: u64,
+    },
+    Ready {
+        path: PathBuf,
+        bytes: u64,
+    },
+    Disabled,
+}
+
+struct ReplayCache {
+    budget: Arc<AudioCacheBudget>,
+    state: Mutex<ReplayCacheState>,
+    changed: Notify,
+}
+
+impl ReplayCache {
+    fn new(budget: Arc<AudioCacheBudget>) -> Self {
+        Self {
+            budget,
+            state: Mutex::new(ReplayCacheState::Empty),
+            changed: Notify::new(),
+        }
+    }
+
+    fn start(&self) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if !matches!(*state, ReplayCacheState::Empty) {
+            return matches!(
+                *state,
+                ReplayCacheState::Writing { .. } | ReplayCacheState::Ready { .. }
+            );
+        }
+        if self.budget.max_bytes == 0 {
+            *state = ReplayCacheState::Disabled;
+            self.changed.notify_one();
+            return false;
+        }
+        match self.budget.create_file() {
+            Ok((path, file)) => {
+                *state = ReplayCacheState::Writing {
+                    path,
+                    file,
+                    bytes: 0,
+                };
+                true
+            }
+            Err(_) => {
+                *state = ReplayCacheState::Disabled;
+                self.changed.notify_one();
+                false
+            }
+        }
+    }
+
+    fn append(&self, bytes: &[u8]) {
+        if bytes.is_empty() || !self.budget.reserve(bytes.len() as u64) {
+            if !bytes.is_empty() {
+                self.disable();
+            }
+            return;
+        }
+
+        let Ok(mut state) = self.state.lock() else {
+            self.budget.release(bytes.len() as u64);
+            self.disable();
+            return;
+        };
+        let ReplayCacheState::Writing {
+            path,
+            file,
+            bytes: written,
+        } = &mut *state
+        else {
+            self.budget.release(bytes.len() as u64);
+            return;
+        };
+        if file.write_all(bytes).is_err() {
+            let path = path.clone();
+            let written = *written + bytes.len() as u64;
+            *state = ReplayCacheState::Disabled;
+            self.budget.release(written);
+            let _ = fs::remove_file(path);
+            self.changed.notify_one();
+            return;
+        }
+        *written += bytes.len() as u64;
+    }
+
+    fn finish(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            self.disable();
+            return;
+        };
+        let old = std::mem::replace(&mut *state, ReplayCacheState::Disabled);
+        let ReplayCacheState::Writing {
+            path,
+            mut file,
+            bytes,
+        } = old
+        else {
+            *state = old;
+            return;
+        };
+        if file.flush().is_ok() {
+            drop(file);
+            *state = ReplayCacheState::Ready { path, bytes };
+        } else {
+            drop(file);
+            self.budget.release(bytes);
+            let _ = fs::remove_file(path);
+        }
+        self.changed.notify_one();
+    }
+
+    fn disable(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let old = std::mem::replace(&mut *state, ReplayCacheState::Disabled);
+        match old {
+            ReplayCacheState::Writing { path, file, bytes } => {
+                drop(file);
+                self.budget.release(bytes);
+                let _ = fs::remove_file(path);
+            }
+            ReplayCacheState::Ready { path, bytes } => {
+                self.budget.release(bytes);
+                let _ = fs::remove_file(path);
+            }
+            ReplayCacheState::Empty | ReplayCacheState::Disabled => {}
+        }
+        self.changed.notify_one();
+    }
+
+    async fn completed_path(&self) -> Option<PathBuf> {
+        loop {
+            let notified = self.changed.notified();
+            {
+                let state = self.state.lock().ok()?;
+                match &*state {
+                    ReplayCacheState::Ready { path, .. } => return Some(path.clone()),
+                    ReplayCacheState::Writing { .. } => {}
+                    ReplayCacheState::Empty | ReplayCacheState::Disabled => return None,
+                }
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Drop for ReplayCache {
+    fn drop(&mut self) {
+        let Ok(state) = self.state.get_mut() else {
+            return;
+        };
+        match std::mem::replace(state, ReplayCacheState::Disabled) {
+            ReplayCacheState::Writing { path, file, bytes } => {
+                drop(file);
+                self.budget.release(bytes);
+                let _ = fs::remove_file(path);
+            }
+            ReplayCacheState::Ready { path, bytes } => {
+                self.budget.release(bytes);
+                let _ = fs::remove_file(path);
+            }
+            ReplayCacheState::Empty | ReplayCacheState::Disabled => {}
+        }
+    }
+}
+
 struct MediaPipeline {
     children: Vec<Child>,
     chunks: Mutex<mpsc::Receiver<Vec<u8>>>,
@@ -201,18 +465,37 @@ impl MediaPipeline {
     fn new(
         mut output: std::process::ChildStdout,
         children: Vec<Child>,
+        replay_cache: Option<Arc<ReplayCache>>,
     ) -> Result<Self, (io::Error, Vec<Child>)> {
         let (sender, receiver) = mpsc::sync_channel(Self::BUFFERED_CHUNKS);
+        let worker_cache = replay_cache.clone();
         let worker = thread::Builder::new()
             .name("punkbot-audio-read-ahead".to_owned())
             .spawn(move || {
                 loop {
                     let mut chunk = vec![0; Self::READ_CHUNK_BYTES];
                     match output.read(&mut chunk) {
-                        Ok(0) | Err(_) => break,
+                        Ok(0) => {
+                            if let Some(cache) = &worker_cache {
+                                cache.finish();
+                            }
+                            break;
+                        }
+                        Err(_) => {
+                            if let Some(cache) = &worker_cache {
+                                cache.disable();
+                            }
+                            break;
+                        }
                         Ok(bytes_read) => {
                             chunk.truncate(bytes_read);
+                            if let Some(cache) = &worker_cache {
+                                cache.append(&chunk);
+                            }
                             if sender.send(chunk).is_err() {
+                                if let Some(cache) = &worker_cache {
+                                    cache.disable();
+                                }
                                 break;
                             }
                         }
@@ -292,12 +575,12 @@ impl Drop for MediaPipeline {
     }
 }
 
-#[derive(Debug)]
 struct MediaInput {
     url: String,
     seek_seconds: u64,
     filters: String,
     cookies: Option<PathBuf>,
+    replay_cache: Arc<ReplayCache>,
 }
 
 #[async_trait]
@@ -311,8 +594,37 @@ impl Compose for MediaInput {
     ) -> Result<AudioStream<Box<dyn MediaSource>>, AudioStreamError> {
         let settings = MediaSettings {
             cookies: self.cookies.clone(),
+            audio_cache: self.replay_cache.budget.clone(),
         };
-        settings.spawn(&self.url, self.seek_seconds, &self.filters)
+        if let Some(path) = self.replay_cache.completed_path().await {
+            match File::open(path) {
+                Ok(file) => {
+                    let input: Input = RawAdapter::new(file, 48_000, 2).into();
+                    match input {
+                        Input::Live(LiveInput::Raw(stream), _) => Ok(stream),
+                        _ => Err(AudioStreamError::Fail(Box::new(io::Error::other(
+                            "unexpected cached media input state",
+                        )))),
+                    }
+                }
+                Err(_) => {
+                    self.replay_cache.disable();
+                    settings.spawn(
+                        &self.url,
+                        self.seek_seconds,
+                        &self.filters,
+                        self.replay_cache.clone(),
+                    )
+                }
+            }
+        } else {
+            settings.spawn(
+                &self.url,
+                self.seek_seconds,
+                &self.filters,
+                self.replay_cache.clone(),
+            )
+        }
     }
 
     fn should_create_async(&self) -> bool {

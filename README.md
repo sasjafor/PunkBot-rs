@@ -46,6 +46,7 @@ Playback disconnects after five idle minutes. Queues and settings are held in me
 
 - `YOUTUBE_COOKIES_FILE`: Netscape-format YouTube cookies file for age-restricted media. If unset, PunkBot-rs also checks `.data/youtube.data`.
 - `HEALTHCHECK_URL`: optional endpoint to ping every five minutes. No external healthcheck URL is built into the program.
+- `AUDIO_CACHE_MAX_BYTES`: maximum combined size of temporary replay audio caches across tracks in this process. Defaults to `1073741824` (1 GiB); set to `0` to disable replay caching.
 
 ## Docker
 
