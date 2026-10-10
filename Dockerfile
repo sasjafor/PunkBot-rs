@@ -1,4 +1,4 @@
-FROM rust:1-alpine AS build
+FROM rust:1.98.1-alpine3.24 AS build
 
 WORKDIR /app
 RUN apk add --no-cache build-base cmake pkgconf opus-dev
@@ -6,7 +6,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN cargo build --release
 
-FROM node:24-alpine
+FROM node:24.21.0-alpine3.24
 RUN apk add --no-cache ca-certificates ffmpeg opus python3 py3-pip
 COPY .release-versions/youtube-dlp-latest.txt /tmp/youtube-dlp-version
 RUN yt_dlp_version="$(cat /tmp/youtube-dlp-version)" \
