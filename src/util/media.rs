@@ -1,6 +1,8 @@
 use poise::serenity_prelude::async_trait;
 use songbird::input::core::io::MediaSource;
-use songbird::input::{AudioStream, AudioStreamError, ChildContainer, Compose, Input, LiveInput};
+use songbird::input::{
+    AudioStream, AudioStreamError, ChildContainer, Compose, Input, LiveInput, RawAdapter,
+};
 use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -85,9 +87,9 @@ impl MediaSettings {
                 "-ar",
                 "48000",
                 "-c:a",
-                "pcm_s16le",
+                "pcm_f32le",
                 "-f",
-                "wav",
+                "f32le",
                 "pipe:1",
             ])
             .stdin(Stdio::from(input))
@@ -101,7 +103,10 @@ impl MediaSettings {
                 return Err(AudioStreamError::Fail(Box::new(error)));
             }
         };
-        let input: Input = ChildContainer::new(vec![downloader, transcoder]).into();
+        let source = songbird::input::core::io::ReadOnlySource::new(ChildContainer::new(vec![
+            downloader, transcoder,
+        ]));
+        let input: Input = RawAdapter::new(source, 48_000, 2).into();
         match input {
             Input::Live(LiveInput::Raw(stream), _) => Ok(stream),
             _ => Err(AudioStreamError::Fail(Box::new(std::io::Error::other(
