@@ -12,11 +12,13 @@ use std::{
         mpsc,
     },
     thread,
+    time::{Duration, SystemTime},
 };
 use tokio::process::Command as AsyncCommand;
 use tokio::sync::Notify;
 
 const DEFAULT_AUDIO_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+const AUDIO_CACHE_DIRECTORY: &str = "punkbot-rs-audio-cache";
 static NEXT_CACHE_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
@@ -228,6 +230,15 @@ struct AudioCacheBudget {
 
 impl AudioCacheBudget {
     fn new(max_bytes: u64) -> Self {
+        cleanup_orphaned_audio_caches();
+        let _ = thread::Builder::new()
+            .name("punkbot-audio-cache-cleanup".to_owned())
+            .spawn(|| {
+                loop {
+                    thread::sleep(Duration::from_secs(10 * 60));
+                    cleanup_orphaned_audio_caches();
+                }
+            });
         Self {
             max_bytes,
             used_bytes: AtomicU64::new(0),
@@ -260,16 +271,67 @@ impl AudioCacheBudget {
     }
 
     fn create_file(&self) -> io::Result<(PathBuf, File)> {
-        let directory = std::env::temp_dir().join("punkbot-rs-audio-cache");
+        let directory = std::env::temp_dir().join(AUDIO_CACHE_DIRECTORY);
         fs::create_dir_all(&directory)?;
         loop {
             let id = NEXT_CACHE_FILE_ID.fetch_add(1, Ordering::Relaxed);
             let path = directory.join(format!("{}-{id}.f32le", std::process::id()));
             match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(file) => return Ok((path, file)),
+                Ok(file) => {
+                    if let Err(error) = file.try_lock() {
+                        let _ = fs::remove_file(&path);
+                        return Err(match error {
+                            std::fs::TryLockError::Error(error) => error,
+                            std::fs::TryLockError::WouldBlock => {
+                                io::Error::other("new audio cache file was unexpectedly locked")
+                            }
+                        });
+                    }
+                    return Ok((path, file));
+                }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error),
             }
+        }
+    }
+}
+
+fn cleanup_orphaned_audio_caches() {
+    let directory = std::env::temp_dir().join(AUDIO_CACHE_DIRECTORY);
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .extension()
+            .is_none_or(|extension| extension != "f32le")
+        {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let Some((pid, id)) = stem.split_once('-') else {
+            continue;
+        };
+        if pid.parse::<u32>().is_err() || id.parse::<u64>().is_err() {
+            continue;
+        }
+        let is_stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+            .is_some_and(|age| age >= Duration::from_secs(60));
+        if !is_stale {
+            continue;
+        }
+        let Ok(file) = OpenOptions::new().read(true).open(&path) else {
+            continue;
+        };
+        if file.try_lock().is_ok() {
+            let _ = fs::remove_file(path);
         }
     }
 }
@@ -284,6 +346,7 @@ enum ReplayCacheState {
     Ready {
         path: PathBuf,
         bytes: u64,
+        _lease: File,
     },
     Disabled,
 }
@@ -385,8 +448,11 @@ impl ReplayCache {
             return;
         };
         if file.flush().is_ok() {
-            drop(file);
-            *state = ReplayCacheState::Ready { path, bytes };
+            *state = ReplayCacheState::Ready {
+                path,
+                bytes,
+                _lease: file,
+            };
         } else {
             drop(file);
             self.budget.release(bytes);
@@ -406,7 +472,12 @@ impl ReplayCache {
                 self.budget.release(bytes);
                 let _ = fs::remove_file(path);
             }
-            ReplayCacheState::Ready { path, bytes } => {
+            ReplayCacheState::Ready {
+                path,
+                bytes,
+                _lease,
+            } => {
+                drop(_lease);
                 self.budget.release(bytes);
                 let _ = fs::remove_file(path);
             }
@@ -442,7 +513,12 @@ impl Drop for ReplayCache {
                 self.budget.release(bytes);
                 let _ = fs::remove_file(path);
             }
-            ReplayCacheState::Ready { path, bytes } => {
+            ReplayCacheState::Ready {
+                path,
+                bytes,
+                _lease,
+            } => {
+                drop(_lease);
                 self.budget.release(bytes);
                 let _ = fs::remove_file(path);
             }
