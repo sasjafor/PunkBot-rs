@@ -234,11 +234,10 @@ pub(super) async fn play_result(
         }
         embed
     } else {
-        let item = queued(
-            &ctx,
-            requested_video.expect("playable results were checked above"),
-            initial_seek_seconds,
-        );
+        let Some(requested_video) = requested_video else {
+            return Err(command_error("No playable videos were found".into()));
+        };
+        let item = queued(&ctx, requested_video, initial_seek_seconds);
         let state = player.lock().await;
         playback_embed(&item, queued_position, &state).await
     };

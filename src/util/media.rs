@@ -19,7 +19,7 @@ impl MediaSettings {
             .filter(|path| path.is_file())
             .or_else(|| {
                 Path::new(".data/youtube.data")
-                    .exists()
+                    .is_file()
                     .then(|| PathBuf::from(".data/youtube.data"))
             });
         Self { cookies }
