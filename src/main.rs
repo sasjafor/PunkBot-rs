@@ -142,11 +142,25 @@ async fn main() -> Result<(), PError> {
 
     if let Ok(healthcheck_url) = env::var("HEALTHCHECK_URL") {
         tokio::spawn(async move {
-            let client = reqwest::Client::new();
+            let client = match reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+            {
+                Ok(client) => client,
+                Err(error) => {
+                    tracing::error!("Could not create healthcheck client: {error}");
+                    return;
+                }
+            };
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
             loop {
                 interval.tick().await;
-                if let Err(error) = client.get(&healthcheck_url).send().await {
+                if let Err(error) = client
+                    .get(&healthcheck_url)
+                    .send()
+                    .await
+                    .and_then(reqwest::Response::error_for_status)
+                {
                     tracing::warn!("Healthcheck ping failed: {error}");
                 }
             }
