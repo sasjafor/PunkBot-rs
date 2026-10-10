@@ -23,6 +23,8 @@ pub struct Playlist {
     pub title: String,
     pub url: String,
     pub item_count: usize,
+    pub channel: Option<String>,
+    pub thumbnail: Option<String>,
 }
 
 #[derive(Clone)]
@@ -280,6 +282,8 @@ impl YoutubeApi {
             title: item.snippet.title,
             url: format!("https://www.youtube.com/playlist?list={}", item.id),
             item_count: item.content_details.item_count,
+            channel: item.snippet.channel_title,
+            thumbnail: item.snippet.thumbnails.and_then(|t| t.best()),
         })
     }
 

@@ -63,6 +63,55 @@ pub(super) fn queued(ctx: &PContext<'_>, video: Video, seek_seconds: u64) -> Que
     }
 }
 
+pub(super) async fn playback_embed(
+    item: &QueuedVideo,
+    queue_position: usize,
+    player: &Player,
+) -> serenity::CreateEmbed {
+    let is_queued = queue_position > 0;
+    let duration = item
+        .video
+        .duration
+        .map(format_duration)
+        .unwrap_or_else(|| "Unknown".to_owned());
+    let mut embed = serenity::CreateEmbed::new()
+        .title(item.video.title.clone())
+        .url(item.video.url.clone())
+        .author(
+            serenity::CreateEmbedAuthor::new(if is_queued {
+                "Added to queue"
+            } else {
+                "Playing"
+            })
+            .icon_url(item.requester_avatar.clone())
+            .url("https://github.com/sasjafor/PunkBot"),
+        )
+        .colour(serenity::Colour::from_rgb(0, 86, 191))
+        .field("Song Duration", duration, true)
+        .field("Requested by", format!("<@{}>", item.requester_id), true);
+    if let Some(channel) = item.video.channel.as_deref() {
+        embed = embed.field("Channel", channel, true);
+    }
+    if let Some(thumbnail) = item.video.thumbnail.as_deref() {
+        embed = embed.thumbnail(thumbnail);
+    }
+    if is_queued {
+        let estimated_wait = if player.looping {
+            "∞".to_owned()
+        } else {
+            player
+                .estimated_wait(queue_position)
+                .await
+                .map(format_duration)
+                .unwrap_or_else(|| "Unknown".to_owned())
+        };
+        embed = embed
+            .field("Estimated time until playing", estimated_wait, true)
+            .field("Position in queue", queue_position.to_string(), true);
+    }
+    embed
+}
+
 pub(super) async fn play_result(
     ctx: PContext<'_>,
     query: String,
@@ -78,12 +127,12 @@ pub(super) async fn play_result(
         author_channel(&ctx).ok_or_else(|| command_error("Join a voice channel first".into()))?;
     let data = ctx.data();
     let mut videos = Vec::new();
-    let mut playlist_name = None;
+    let mut playlist_info = None;
     let mut initial_seek_seconds = 0;
 
     if let Some(id) = youtube_playlist_id(&query) {
         let playlist = data.youtube.playlist(&id).await.map_err(command_error)?;
-        playlist_name = Some((playlist.title, playlist.item_count));
+        playlist_info = Some(playlist);
         let ids = data
             .youtube
             .playlist_video_ids(&id)
@@ -143,14 +192,7 @@ pub(super) async fn play_result(
 
     let player = data.player_state(guild_id(&ctx)?).await;
     let total = videos.len();
-    let requested_title = videos
-        .first()
-        .map(|video| video.title.clone())
-        .unwrap_or_default();
-    let requested_url = videos
-        .first()
-        .map(|video| video.url.clone())
-        .unwrap_or_default();
+    let requested_video = videos.first().cloned();
     let seek_video_id = videos.first().map(|video| video.id.clone());
     let mut queued_position = 0;
     // Preserve playlist order when placing several tracks at the front.
@@ -173,16 +215,37 @@ pub(super) async fn play_result(
         .await
         .map_err(command_error)?;
     }
-    let content = if let Some((name, advertised_count)) = playlist_name {
-        format!("Enqueued playlist **{name}** ({total}/{advertised_count} available tracks).")
-    } else {
-        if queued_position == 0 {
-            format!("▶️ **Playing** [{requested_title}]({requested_url})")
-        } else {
-            format!(
-                "Added [{requested_title}]({requested_url}) to the queue at position {queued_position}."
+    let embed = if let Some(playlist) = playlist_info {
+        let mut embed = serenity::CreateEmbed::new()
+            .title(playlist.title)
+            .url(playlist.url)
+            .author(
+                serenity::CreateEmbedAuthor::new("Enqueued playlist")
+                    .icon_url(ctx.author().face())
+                    .url("https://github.com/sasjafor/PunkBot"),
             )
+            .field(
+                "Enqueued Items",
+                format!("{total}/{}", playlist.item_count),
+                true,
+            );
+        if let Some(channel) = playlist.channel {
+            embed = embed.field("Channel", channel, true);
         }
+        if let Some(thumbnail) = playlist.thumbnail {
+            embed = embed.thumbnail(thumbnail);
+        }
+        embed
+    } else {
+        let item = queued(
+            &ctx,
+            requested_video.expect("playable results were checked above"),
+            initial_seek_seconds,
+        );
+        let state = player.lock().await;
+        playback_embed(&item, queued_position, &state).await
     };
-    reply(ctx, content, silent).await
+    ctx.send(CreateReply::default().embed(embed).ephemeral(silent))
+        .await?;
+    Ok(())
 }

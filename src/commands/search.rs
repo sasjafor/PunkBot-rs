@@ -95,23 +95,14 @@ pub async fn search(
             break;
         }
         let player = state(&ctx).await?;
-        let position = Player::enqueue(
-            &ctx,
-            player,
-            queued(&ctx, video.clone(), 0),
-            channel_id,
-            false,
-        )
-        .await
-        .map_err(command_error)?;
-        let embed = serenity::CreateEmbed::new()
-            .title(video.title)
-            .url(video.url)
-            .description(if position == 0 {
-                "▶️ Playing"
-            } else {
-                "Added to queue"
-            });
+        let item = queued(&ctx, video.clone(), 0);
+        let position = Player::enqueue(&ctx, player.clone(), item.clone(), channel_id, false)
+            .await
+            .map_err(command_error)?;
+        let embed = {
+            let player = player.lock().await;
+            playback_embed(&item, position, &player).await
+        };
         let response = CreateInteractionResponseMessage::default()
             .embed(embed)
             .components(Vec::new());

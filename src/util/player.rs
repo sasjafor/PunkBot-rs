@@ -125,6 +125,26 @@ impl Player {
         self.items.len().saturating_sub(1)
     }
 
+    pub async fn estimated_wait(&self, queue_position: usize) -> Option<u64> {
+        if queue_position == 0 {
+            return Some(0);
+        }
+        let current = self.items.front()?;
+        let mut total = current
+            .video
+            .duration?
+            .saturating_sub(self.current_position().await);
+        for item in self
+            .items
+            .iter()
+            .skip(1)
+            .take(queue_position.saturating_sub(1))
+        {
+            total = total.checked_add(item.video.duration?)?;
+        }
+        Some(total)
+    }
+
     pub async fn status(&self) -> Option<PlayMode> {
         match &self.track {
             Some(track) => track.get_info().await.ok().map(|s| s.playing),
