@@ -6,7 +6,7 @@ A Rust implementation of [PunkBot](https://github.com/sasjafor/PunkBot), followi
 
 - Rust toolchain (Edition 2024)
 - FFmpeg and `ffprobe`
-- `yt-dlp` and Node.js (for YouTube's JavaScript player challenges)
+- `yt-dlp` and Node.js 22 or newer (for YouTube's JavaScript player challenges)
 - `libopus` development files when building on Linux
 - A Discord application bot token and a YouTube Data API key
 
