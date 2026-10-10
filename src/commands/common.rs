@@ -169,16 +169,13 @@ pub(super) async fn play_result(
             age_restricted: false,
         });
     } else {
-        let results = data
-            .youtube
-            .search(&query, 1)
-            .await
-            .map_err(command_error)?;
-        let found = results
-            .into_iter()
-            .next()
-            .ok_or_else(|| command_error("No matches".into()))?;
-        videos.push(data.youtube.video(&found.id).await.map_err(command_error)?);
+        videos.push(
+            data.youtube
+                .search_first(&query)
+                .await
+                .map_err(command_error)?
+                .ok_or_else(|| command_error("No matches".into()))?,
+        );
     }
 
     if videos.is_empty() {

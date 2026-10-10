@@ -32,6 +32,7 @@ pub struct YoutubeApi {
     client: Client,
     key: String,
     cache: Arc<Mutex<VideoCache>>,
+    search_cache: Arc<Mutex<SearchCache>>,
 }
 
 #[derive(Default)]
@@ -52,6 +53,32 @@ impl VideoCache {
         self.order.retain(|key| key != &id);
         self.order.push_back(id.clone());
         self.entries.insert(id, video);
+        while self.entries.len() > 100 {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct SearchCache {
+    entries: HashMap<String, String>,
+    order: VecDeque<String>,
+}
+
+impl SearchCache {
+    fn get(&mut self, query: &str) -> Option<String> {
+        let id = self.entries.get(query)?.clone();
+        self.order.retain(|entry| entry != query);
+        self.order.push_back(query.to_owned());
+        Some(id)
+    }
+
+    fn insert(&mut self, query: String, id: String) {
+        self.order.retain(|entry| entry != &query);
+        self.order.push_back(query.clone());
+        self.entries.insert(query, id);
         while self.entries.len() > 100 {
             if let Some(oldest) = self.order.pop_front() {
                 self.entries.remove(&oldest);
@@ -169,6 +196,7 @@ impl YoutubeApi {
             client: Client::new(),
             key,
             cache: Arc::new(Mutex::new(VideoCache::default())),
+            search_cache: Arc::new(Mutex::new(SearchCache::default())),
         }
     }
 
@@ -230,6 +258,29 @@ impl YoutubeApi {
                 })
             })
             .collect())
+    }
+
+    pub async fn search_first(&self, query: &str) -> Result<Option<Video>, String> {
+        let cached_id = self.search_cache.lock().await.get(query);
+        if let Some(id) = cached_id {
+            return self.video(&id).await.map(Some);
+        }
+        let Some(found) = self.search(query, 1).await?.into_iter().next() else {
+            return Ok(None);
+        };
+        let video = self.video(&found.id).await?;
+        self.search_cache
+            .lock()
+            .await
+            .insert(query.to_owned(), found.id);
+        Ok(Some(video))
+    }
+
+    pub async fn remember_search_choice(&self, query: &str, video_id: &str) {
+        self.search_cache
+            .lock()
+            .await
+            .insert(query.to_owned(), video_id.to_owned());
     }
 
     pub async fn video(&self, id: &str) -> Result<Video, String> {

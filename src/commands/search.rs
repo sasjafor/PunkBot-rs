@@ -99,6 +99,7 @@ pub async fn search(
         let position = Player::enqueue(&ctx, player.clone(), item.clone(), channel_id, false)
             .await
             .map_err(command_error)?;
+        ctx.data().youtube.remember_search_choice(&query, &id).await;
         let embed = {
             let player = player.lock().await;
             playback_embed(&item, position, &player).await
