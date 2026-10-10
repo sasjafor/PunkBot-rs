@@ -1,3 +1,9 @@
 /target
 .data/
 .env
+
+test_run.sh
+debug_test_run.sh
+test_run_container.sh
+test_functions.txt
+experimental_test_functions.txt
