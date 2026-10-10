@@ -1,16 +1,16 @@
-FROM rust:1-bookworm AS build
+FROM rust:1-alpine AS build
 
 WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends build-essential cmake pkg-config libopus-dev && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache build-base cmake pkgconf opus-dev
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN cargo build --release
 
-FROM node:24-bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates ffmpeg python3 libopus0 && rm -rf /var/lib/apt/lists/*
+FROM node:24-alpine
+RUN apk add --no-cache ca-certificates ffmpeg opus python3 py3-pip
 COPY .release-versions/youtube-dlp-latest.txt /tmp/youtube-dlp-version
-RUN python3 -c 'from pathlib import Path; from urllib.request import urlretrieve; version = Path("/tmp/youtube-dlp-version").read_text().strip(); urlretrieve(f"https://github.com/yt-dlp/yt-dlp/releases/download/{version}/yt-dlp", "/usr/local/bin/yt-dlp")' \
-    && chmod a+rx /usr/local/bin/yt-dlp \
+RUN yt_dlp_version="$(cat /tmp/youtube-dlp-version)" \
+    && python3 -m pip install --break-system-packages --no-cache-dir "yt-dlp==${yt_dlp_version}" \
     && rm /tmp/youtube-dlp-version
 WORKDIR /app
 COPY --from=build /app/target/release/punk_bot /usr/local/bin/punk_bot
