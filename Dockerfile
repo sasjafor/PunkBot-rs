@@ -8,6 +8,7 @@ COPY src ./src
 RUN cargo build --release
 
 FROM node:24.21.0-alpine3.24
+ENV RUST_LOG=warn
 RUN apk add --no-cache ca-certificates ffmpeg opus python3 py3-pip
 COPY .release-versions/youtube-dlp-latest.txt /tmp/youtube-dlp-version
 RUN yt_dlp_version="$(cat /tmp/youtube-dlp-version)" \
