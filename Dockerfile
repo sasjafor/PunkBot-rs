@@ -1,7 +1,8 @@
 FROM rust:1.98.1-alpine3.24 AS build
 
 WORKDIR /app
-RUN apk add --no-cache build-base cmake pkgconf opus-dev
+RUN apk add --no-cache build-base cmake pkgconf
+ENV OPUS_BUNDLED=1
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN cargo build --release
