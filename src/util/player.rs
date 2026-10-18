@@ -408,12 +408,13 @@ impl Player {
     pub async fn skip(
         &mut self,
         ctx: &poise::Context<'_, Data, crate::PError>,
-    ) -> Result<String, String> {
+    ) -> Result<(String, Option<String>), String> {
         let title = self
             .items
             .front()
             .map(|item| item.video.title.clone())
             .ok_or("Nothing is playing")?;
+        let next_title = self.items.get(1).map(|item| item.video.title.clone());
         let manager = ctx.data().voice.clone();
         let guild_id = ctx
             .guild_id()
@@ -431,7 +432,7 @@ impl Player {
             .queue()
             .skip()
             .map_err(|e| e.to_string())?;
-        Ok(title)
+        Ok((title, next_title))
     }
 
     async fn rebuild_queue(
