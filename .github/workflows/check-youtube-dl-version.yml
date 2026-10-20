@@ -21,11 +21,18 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Fetch the latest yt-dlp release version
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+          version_file=".release-versions/youtube-dlp-latest.txt.tmp"
           curl --fail --silent --show-error --location \
+            --retry 5 --retry-all-errors --retry-delay 2 \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header 'Accept: application/vnd.github+json' \
             https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest \
-            | jq --exit-status --raw-output '.tag_name' \
-            > .release-versions/youtube-dlp-latest.txt
+            | jq --exit-status --raw-output '.tag_name' > "$version_file"
+          mv "$version_file" .release-versions/youtube-dlp-latest.txt
 
       - name: Commit version update
         id: version
